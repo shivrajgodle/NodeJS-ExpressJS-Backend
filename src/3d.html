@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gesture Controlled 3D Particles</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: sans-serif; }
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 1; }
+        #video-feed { position: absolute; bottom: 20px; right: 20px; width: 320px; height: 240px; transform: scaleX(-1); border: 2px solid #333; border-radius: 8px; z-index: 2; opacity: 0.8; }
+        #ui { position: absolute; top: 20px; left: 20px; color: white; z-index: 3; pointer-events: none; }
+        h1 { margin: 0; font-size: 1.5rem; text-shadow: 0 0 10px rgba(0,255,255,0.5); }
+        p { margin: 5px 0; opacity: 0.8; font-size: 0.9rem; }
+        .status { color: #00ff88; font-weight: bold; }
+    </style>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="ui">
+        <h1>Interactive Particle System</h1>
+        <p>☝️ <b>Index Finger:</b> Attract Particles</p>
+        <p>👌 <b>Pinch:</b> Change Colors</p>
+        <p>✊ <b>Fist:</b> Cycle Shapes (Heart, Saturn, Flower)</p>
+        <p id="debug-text">Loading Model...</p>
+    </div>
+
+    <video id="video-feed" playsinline></video>
+    <div id="canvas-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- CONFIGURATION ---
+        const PARTICLE_COUNT = 15000;
+        const CAM_Z = 150;
+        
+        // --- STATE ---
+        const state = {
+            mouseX: 0,
+            mouseY: 0,
+            isPinching: false,
+            isFist: false,
+            shapeIndex: 0,
+            lastFistTime: 0,
+            colorHue: 0.6 // Blueish start
+        };
+
+        const shapes = ['sphere', 'heart', 'saturn', 'flower'];
+
+        // --- THREE.JS SETUP ---
+        const container = document.getElementById('canvas-container');
+        const scene = new THREE.Scene();
+        // Add subtle fog for depth
+        scene.fog = new THREE.FogExp2(0x000000, 0.002);
+
+        const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = CAM_Z;
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        // --- SHADER MATERIAL ---
+        // We use shaders for high performance particle movement on the GPU
+        const vertexShader = `
+            uniform float uTime;
+            uniform float uSize;
+            uniform vec3 uMouse;
+            uniform float uMixFactor; 
+            
+            attribute vec3 aTarget; // The target shape position
+            attribute float aRandom;
+            attribute float aSize;
+            
+            varying vec3 vColor;
+            varying float vDist;
+
+            // Simplex noise function (simplified)
+            vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+            vec4 permute(vec4 x) { return mod289(((x*34.0)+1.0)*x); }
+            vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+            float snoise(vec3 v) {
+                const vec2  C = vec2(1.0/6.0, 1.0/3.0) ;
+                const vec4  D = vec4(0.0, 0.5, 1.0, 2.0);
+                vec3 i  = floor(v + dot(v, C.yyy) );
+                vec3 x0 = v - i + dot(i, C.xxx) ;
+                vec3 g = step(x0.yzx, x0.xyz);
+                vec3 l = 1.0 - g;
+                vec3 i1 = min( g.xyz, l.zxy );
+                vec3 i2 = max( g.xyz, l.zxy );
+                vec3 x1 = x0 - i1 + C.xxx;
+                vec3 x2 = x0 - i2 + C.yyy;
+                vec3 x3 = x0 - D.yyy;
+                i = mod289(i); 
+                vec4 p = permute( permute( permute( 
+                            i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+                        + i.y + vec4(0.0, i1.y, i2.y, 1.0 )) 
+                        + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+                float n_ = 0.142857142857; 
+                vec3  ns = n_ * D.wyz - D.xzx;
+                vec4 j = p - 49.0 * floor(p * ns.z * ns.z); 
+                vec4 x_ = floor(j * ns.z);
+                vec4 y_ = floor(j - 7.0 * x_ );  
+                vec4 x = x_ *ns.x + ns.yyyy;
+                vec4 y = y_ *ns.x + ns.yyyy;
+                vec4 h = 1.0 - abs(x) - abs(y);
+                vec4 b0 = vec4( x.xy, y.xy );
+                vec4 b1 = vec4( x.zw, y.zw );
+                vec4 s0 = floor(b0)*2.0 + 1.0;
+                vec4 s1 = floor(b1)*2.0 + 1.0;
+                vec4 sh = -step(h, vec4(0.0));
+                vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+                vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+                vec3 p0 = vec3(a0.xy,h.x);
+                vec3 p1 = vec3(a0.zw,h.y);
+                vec3 p2 = vec3(a1.xy,h.z);
+                vec3 p3 = vec3(a1.zw,h.w);
+                vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2, p2), dot(p3,p3)));
+                p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+                vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+                m = m * m;
+                return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1), 
+                                            dot(p2,x2), dot(p3,x3) ) );
+            }
+
+            void main() {
+                // Morphing logic: Interpolate between current position and target attribute
+                // Ideally we handle full physics in JS, but for shape morphing, mixing coords is easier here
+                vec3 pos = position; 
+                vec3 target = aTarget;
+                
+                // Mix current shape with target shape based on uMixFactor (0 to 1)
+                vec3 mixedPos = mix(pos, target, uMixFactor);
+
+                // Add Noise/Flow
+                float noise = snoise(vec3(mixedPos.x * 0.05, mixedPos.y * 0.05, uTime * 0.2));
+                mixedPos += normal * noise * 2.0;
+
+                // Mouse/Hand Interaction (Attraction)
+                float d = distance(mixedPos.xy, uMouse.xy);
+                if(d < 40.0) {
+                    // Push away or attract slightly
+                    mixedPos.z += (40.0 - d) * 2.0 * sin(uTime * 5.0);
+                }
+
+                vec4 mvPosition = modelViewMatrix * vec4(mixedPos, 1.0);
+                gl_Position = projectionMatrix * mvPosition;
+                
+                // Size attenuation
+                gl_PointSize = uSize * aSize * (200.0 / -mvPosition.z);
+                
+                vDist = d; 
+            }
+        `;
+
+        const fragmentShader = `
+            uniform vec3 uColor;
+            uniform float uTime;
+            varying float vDist;
+
+            void main() {
+                // Circular particle
+                float r = distance(gl_PointCoord, vec2(0.5));
+                if (r > 0.5) discard;
+
+                // Glow effect
+                float glow = 1.0 - (r * 2.0);
+                glow = pow(glow, 1.5);
+
+                vec3 finalColor = uColor;
+                
+                // Interactive highlight
+                if(vDist < 30.0) {
+                    finalColor += vec3(0.5, 0.5, 0.5); // Add white highlight near hand
+                }
+
+                gl_FragColor = vec4(finalColor, glow);
+            }
+        `;
+
+        // --- PARTICLE SYSTEM CREATION ---
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const targets = new Float32Array(PARTICLE_COUNT * 3); // Stores the destination shape
+        const randoms = new Float32Array(PARTICLE_COUNT);
+        const sizes = new Float32Array(PARTICLE_COUNT);
+
+        // Helper Math Functions
+        function getPointOnSphere() {
+            const u = Math.random();
+            const v = Math.random();
+            const theta = 2 * Math.PI * u;
+            const phi = Math.acos(2 * v - 1);
+            const r = 40 + Math.random() * 5;
+            return {
+                x: r * Math.sin(phi) * Math.cos(theta),
+                y: r * Math.sin(phi) * Math.sin(theta),
+                z: r * Math.cos(phi)
+            };
+        }
+
+        // Initialize Sphere (Default)
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+            const p = getPointOnSphere();
+            positions[i * 3] = p.x;
+            positions[i * 3 + 1] = p.y;
+            positions[i * 3 + 2] = p.z;
+            
+            targets[i * 3] = p.x;
+            targets[i * 3 + 1] = p.y;
+            targets[i * 3 + 2] = p.z;
+
+            randoms[i] = Math.random();
+            sizes[i] = 0.5 + Math.random();
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('aTarget', new THREE.BufferAttribute(targets, 3)); // For morphing
+        geometry.setAttribute('aRandom', new THREE.BufferAttribute(randoms, 1));
+        geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+
+        const material = new THREE.ShaderMaterial({
+            vertexShader,
+            fragmentShader,
+            uniforms: {
+                uTime: { value: 0 },
+                uSize: { value: 4.0 },
+                uMouse: { value: new THREE.Vector3(0, 0, 0) },
+                uColor: { value: new THREE.Color().setHSL(0.6, 1.0, 0.5) },
+                uMixFactor: { value: 0.0 } // 0 = current positions, 1 = target
+            },
+            transparent: true,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending
+        });
+
+        const points = new THREE.Points(geometry, material);
+        scene.add(points);
+
+        // --- SHAPE GENERATORS ---
+        function calculateShape(shapeType) {
+            const newTargets = new Float32Array(PARTICLE_COUNT * 3);
+            
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                let x, y, z;
+                
+                if (shapeType === 'sphere') {
+                    const p = getPointOnSphere();
+                    x=p.x; y=p.y; z=p.z;
+                } 
+                else if (shapeType === 'heart') {
+                    // Heart parametric equations
+                    const phi = Math.random() * Math.PI * 2;
+                    const theta = Math.random() * Math.PI;
+                    // Simplistic 3D volume heart
+                    // x = 16sin^3(t)
+                    // y = 13cos(t) - 5cos(2t) - 2cos(3t) - cos(4t)
+                    const t = phi;
+                    const r = 2; 
+                    x = r * 16 * Math.pow(Math.sin(t), 3);
+                    y = r * (13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+                    z = (Math.random() - 0.5) * 20; // Thickness
+                } 
+                else if (shapeType === 'saturn') {
+                    const rand = Math.random();
+                    if (rand < 0.6) {
+                        // Planet body
+                        const p = getPointOnSphere();
+                        x = p.x * 0.6; y = p.y * 0.6; z = p.z * 0.6;
+                    } else {
+                        // Rings
+                        const angle = Math.random() * Math.PI * 2;
+                        const radius = 50 + Math.random() * 30;
+                        x = Math.cos(angle) * radius;
+                        z = Math.sin(angle) * radius;
+                        y = (Math.random() - 0.5) * 2;
+                    }
+                    // Tilt
+                    const tilt = 0.4;
+                    const _y = y * Math.cos(tilt) - z * Math.sin(tilt);
+                    const _z = y * Math.sin(tilt) + z * Math.cos(tilt);
+                    y = _y; z = _z;
+                } 
+                else if (shapeType === 'flower') {
+                    // Rose curve logic
+                    const k = 4; // Petals
+                    const theta = Math.random() * Math.PI * 2;
+                    const r = 60 * Math.cos(k * theta);
+                    x = r * Math.cos(theta);
+                    y = r * Math.sin(theta);
+                    z = (Math.random() - 0.5) * 20 + (r/5); // Cup shape
+                }
+
+                newTargets[i * 3] = x;
+                newTargets[i * 3 + 1] = y;
+                newTargets[i * 3 + 2] = z;
+            }
+            return newTargets;
+        }
+
+        function triggerMorph(shapeName) {
+            const newPos = calculateShape(shapeName);
+            
+            // In a real physics engine, we would apply forces. 
+            // In this shader hack, we just swap the buffers.
+            // 1. Set current positions to where they visibly are (approx)
+            // 2. Set targets to new shape
+            // 3. Reset mix factor
+            
+            // For simplicity in this demo: direct update of the aTarget attribute
+            geometry.attributes.aTarget.array.set(newPos);
+            geometry.attributes.aTarget.needsUpdate = true;
+            
+            // Animate uMixFactor from 0 to 1 via GSAP or manual lerp
+            // We will let the shader mix continuously
+            morphStartTime = performance.now();
+        }
+        let morphStartTime = 0;
+
+
+        // --- MEDIAPIPE HANDS SETUP ---
+        const videoElement = document.getElementById('video-feed');
+        const debugText = document.getElementById('debug-text');
+
+        function onResults(results) {
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                debugText.innerText = "Hand Detected";
+                const landmarks = results.multiHandLandmarks[0];
+                
+                // 1. Track Position (Index Finger Tip is #8)
+                const indexTip = landmarks[8];
+                
+                // Map coordinates: MediaPipe (0-1) to Three.js World coords
+                // Approx mapping based on camera Z=150
+                const x = (0.5 - indexTip.x) * 250; 
+                const y = (0.5 - indexTip.y) * 200; 
+                
+                state.mouseX = x;
+                state.mouseY = y;
+
+                // 2. Gesture Detection
+                const thumbTip = landmarks[4];
+                const middleTip = landmarks[12];
+                const ringTip = landmarks[16];
+                const pinkyTip = landmarks[20];
+                const wrist = landmarks[0];
+
+                // Distance between Thumb and Index (Pinch)
+                const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+                state.isPinching = pinchDist < 0.05;
+
+                // Fist Detection (Tips close to wrist)
+                const fingersClosed = [middleTip, ringTip, pinkyTip].every(tip => {
+                    return Math.hypot(tip.x - wrist.x, tip.y - wrist.y) < 0.15;
+                });
+                
+                const now = Date.now();
+                if (fingersClosed && !state.isFist && (now - state.lastFistTime > 1000)) {
+                    // Trigger Shape Switch
+                    state.lastFistTime = now;
+                    state.shapeIndex = (state.shapeIndex + 1) % shapes.length;
+                    const nextShape = shapes[state.shapeIndex];
+                    debugText.innerText = `Switching to: ${nextShape.toUpperCase()}`;
+                    triggerMorph(nextShape);
+                }
+                state.isFist = fingersClosed;
+
+            } else {
+                debugText.innerText = "Show Hand...";
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+        
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        
+        hands.onResults(onResults);
+
+        const cameraFeed = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+        cameraFeed.start();
+
+
+        // --- ANIMATION LOOP ---
+        const clock = new THREE.Clock();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const time = clock.getElapsedTime();
+
+            // Update Shader Uniforms
+            material.uniforms.uTime.value = time;
+            
+            // Smoothly move the attraction point to the hand position
+            const currentMouse = material.uniforms.uMouse.value;
+            currentMouse.x += (state.mouseX - currentMouse.x) * 0.1;
+            currentMouse.y += (state.mouseY - currentMouse.y) * 0.1;
+
+            // Handle Color Changes on Pinch
+            if(state.isPinching) {
+                state.colorHue += 0.01;
+                material.uniforms.uColor.value.setHSL(state.colorHue % 1, 1.0, 0.5);
+            }
+
+            // Handle Morphing Animation
+            // Smoothly increase mix factor to 1.0 when morph is triggered
+            // Here we use a sine wave to just gently breathe between targets if we wanted, 
+            // but for the switch, we essentially just want to slide to the target.
+            // Since we update 'aTarget', let's just animate a mix factor.
+            // Simplified: The vertex shader mixes `position` and `aTarget`. 
+            // To make it persistent, we would update buffers. 
+            // For this visual demo, we will just lerp the uMixFactor up to 1 for the new shape.
+            
+            const timeSinceMorph = performance.now() - morphStartTime;
+            let mix = Math.min(timeSinceMorph / 1000, 1.0); 
+            // We want to ease out
+            mix = 1 - Math.pow(1 - mix, 3);
+            material.uniforms.uMixFactor.value = mix;
+
+            // Rotate entire cloud slightly
+            points.rotation.y = time * 0.1;
+            points.rotation.z = time * 0.05;
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+
+    </script>
+</body>
+</html>
