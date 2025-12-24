@@ -3,7 +3,8 @@ import { config } from "dotenv";
 
 //import routes
 
-import movieRoutes from './routes/MovieRoutes.js'
+import movieRoutes from './routes/MovieRoutes.js';
+import authRoutes from './routes/authRoutes.js';
 import { connectDB, disconnectDB } from "./config/db.js";
 
 config()
@@ -13,6 +14,8 @@ const app = express();
 
 //Api Routes
 app.use("/movies",movieRoutes);
+app.use("/auth",authRoutes);
+
 
 const PORT = 5001;
 
