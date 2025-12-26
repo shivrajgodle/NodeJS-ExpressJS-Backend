@@ -2,9 +2,9 @@ import express from "express";
 import { config } from "dotenv";
 
 //import routes
-
 import movieRoutes from './routes/MovieRoutes.js';
 import authRoutes from './routes/authRoutes.js';
+import watchlistRoutes from './routes/watchlistRoutes.js'
 import { connectDB, disconnectDB } from "./config/db.js";
 
 config()
@@ -19,7 +19,7 @@ app.use(express.urlencoded({extended: true}))
 //Api Routes
 app.use("/movies",movieRoutes);
 app.use("/auth",authRoutes);
-
+app.use("/watchlist",watchlistRoutes);
 
 const PORT = 5001;
 
