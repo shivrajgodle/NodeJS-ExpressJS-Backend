@@ -47,6 +47,51 @@ const addToWatchlist = async (req , res) => {
 }
 
 
+// Update watchlist item
+// Updates status , rating and notes
+// Ensure only owner can update
+// Requires protected middleware
+const updateWatchlist = async (req,res) => {
+    const {status , rating , notes} = req.body;
+
+    //Find Watchlist item and verify ownership
+    const watchlistItem = await prisma.watchlistItem.findUnique({
+        where: {id: req.params.id}
+    });
+    
+    if(!watchlistItem){
+        return res.status(404).json({error : "watchlist item not found"});
+    }
+
+    //Ensure only owner can update
+    if(watchlistItem.userId !== req.user.id){
+        return res.status(403).json({error : "Not allowed to update this watchlist item"});
+    }
+
+    //Build Update data
+    const updateData = {}
+    if(status !== undefined) updateData.status = status.toUpperCase();
+    if(rating !== undefined) updateData.rating = rating;
+    if(notes !== undefined) updateData.notes = notes;
+
+    //Update watchlist data
+    const updatedItem = await prisma.watchlistItem.update({
+        where : {id: req.params.id},
+        data : updateData,
+    });
+
+    res.status(200).json({
+        status: "success",
+        data: {
+            watchlistItem : updatedItem,
+        }
+    });
+
+
+
+}
+
+
 /**
  * Remove movie from watchlist
  * Deletes watchlist item
@@ -81,4 +126,4 @@ const removeFromWatchlist = async (req , res) => {
 
 }
 
-export { addToWatchlist , removeFromWatchlist}
+export { addToWatchlist , removeFromWatchlist, updateWatchlist}
